@@ -173,7 +173,7 @@ if (!is.null(result)) {
     ci_lower <- apply(all_tpr, 2, quantile, probs = 0.025, na.rm = TRUE)
     ci_upper <- apply(all_tpr, 2, quantile, probs = 0.975, na.rm = TRUE)
     
-
+    
     # 绘制平均ROC曲线
     lines(result$fixed_fpr, result$roc_interp_list[[j]], col = colors[j], lwd = 2)
   }
@@ -256,3 +256,92 @@ if (!is.null(result)) {
   }
   cat("Mean log-rank p-value:", round(result$mean_pval, 4), "\n")
 }
+
+#绘制多因素COX
+library(survival)
+library(forestplot)
+library(car) # 用于计算整体效应
+
+# ==== 把 Stage 和 Grade 作为整体因子而不是分开虚拟变量 ====
+# 确保是 factor
+data_all$Stage <- factor(data_all$Stage)
+data_all$Grade <- factor(data_all$Grade)
+
+# Cox 模型
+final_cox <- coxph(Surv(futime, fustat) ~ score + Stage + Grade + New_tumor_event, 
+                   data = data_all)
+
+# 提取单个变量的 HR（score 和 New_tumor_event）
+summary_cox <- summary(final_cox)
+hr <- round(summary_cox$coefficients[, "exp(coef)"], 3)
+ci_lower <- round(summary_cox$conf.int[, "lower .95"], 3)
+ci_upper <- round(summary_cox$conf.int[, "upper .95"], 3)
+p_values <- signif(summary_cox$coefficients[, "Pr(>|z|)"], 3)
+
+# ==== 计算 Stage 和 Grade 的整体 HR ====
+get_overall_hr <- function(varname) {
+  # 获取系数和协方差矩阵
+  idx <- grep(paste0("^", varname), rownames(summary_cox$coefficients))
+  coefs <- coef(final_cox)[idx]
+  cov_mat <- vcov(final_cox)[idx, idx, drop = FALSE]
+  
+  # 整体HR用 exp(加权平均系数) 近似
+  hr_mean <- exp(mean(coefs))
+  se_mean <- sqrt(mean(diag(cov_mat)))
+  
+  ci_low <- exp(mean(coefs) - 1.96 * se_mean)
+  ci_up <- exp(mean(coefs) + 1.96 * se_mean)
+  
+  # 整体p值（Wald检验）
+  p_val <- car::Anova(final_cox, type = "II")[varname, "Pr(>Chisq)"]
+  
+  return(c(HR = hr_mean, lower = ci_low, upper = ci_up, p = p_val))
+}
+
+stage_overall <- get_overall_hr("Stage")
+grade_overall <- get_overall_hr("Grade")
+
+# ==== 组合表格 ====
+# 单因素直接取
+rows <- list(
+  c("score", hr["score"], ci_lower["score"], ci_upper["score"], p_values["score"]),
+  c("Stage", stage_overall["HR"], stage_overall["lower"], stage_overall["upper"], stage_overall["p"]),
+  c("Grade", grade_overall["HR"], grade_overall["lower"], grade_overall["upper"], grade_overall["p"]),
+  c("New tumor event", hr["New_tumor_eventYes"], ci_lower["New_tumor_eventYes"], ci_upper["New_tumor_eventYes"], p_values["New_tumor_eventYes"])
+)
+
+# 转成数据框并格式化
+df_plot <- do.call(rbind, rows)
+df_plot <- data.frame(
+  Variable = df_plot[, 1],
+  HR = as.numeric(df_plot[, 2]),
+  lower = as.numeric(df_plot[, 3]),
+  upper = as.numeric(df_plot[, 4]),
+  p = signif(as.numeric(df_plot[, 5]), 3),
+  stringsAsFactors = FALSE
+)
+
+# 表头 + 数据
+tabletext <- rbind(
+  c("Variable", "Hazard Ratio", "95% CI", "p-value"),
+  cbind(
+    df_plot$Variable,
+    sprintf("%.3f", df_plot$HR),
+    paste0(sprintf("%.3f", df_plot$lower), "-", sprintf("%.3f", df_plot$upper)),
+    sprintf("%.3g", df_plot$p)
+  )
+)
+
+# ==== 绘制森林图 ====
+pdf(file = "multiCox_forest.pdf", width = 8, height = 6)
+forestplot(labeltext = tabletext,
+           mean = c(NA, df_plot$HR),
+           lower = c(NA, df_plot$lower),
+           upper = c(NA, df_plot$upper),
+           zero = 1,
+           boxsize = 0.2,
+           lineheight = unit(8, "mm"),
+           col = fpColors(box="red",line="darkblue", summary="royalblue"),
+           xlab = "Hazard Ratio",
+           title = "Multivariate Cox Regression ")
+dev.off()
